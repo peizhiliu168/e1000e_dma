@@ -268,8 +268,11 @@ static void e1000_poll_timer(struct timer_list *t) {
   {
     static int heartbeat = 0;
     if (++heartbeat >= 1000) {
-      pr_info("%s: Driver heartbeat (RCTL=0x%08x)\n", DRV_NAME,
-              readl(adapter->hw_addr + E1000_RCTL));
+      u32 status = readl(adapter->hw_addr + E1000_STATUS);
+      u32 rdh = readl(adapter->hw_addr + E1000_RDH);
+      u32 rdt = readl(adapter->hw_addr + E1000_RDT);
+      pr_info("%s: Heartbeat RCTL=0x%08x STATUS=0x%08x RDH=%u RDT=%u\n",
+              DRV_NAME, readl(adapter->hw_addr + E1000_RCTL), status, rdh, rdt);
       heartbeat = 0;
     }
   }
