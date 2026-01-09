@@ -27,6 +27,11 @@
 #define E1000_RDH 0x02810   /* RX Descriptor Head - RW */
 #define E1000_RDT 0x02818   /* RX Descriptor Tail - RW */
 
+/* Receive Address Registers */
+#define E1000_RAL0 0x05400
+#define E1000_RAH0 0x05404
+#define E1000_RAH_AV 0x80000000 /* Receive Address Valid */
+
 /* Transmit Rings */
 #define E1000_TDBAL 0x03800 /* TX Descriptor Base Address Low - RW */
 #define E1000_TDBAH 0x03804 /* TX Descriptor Base Address High - RW */

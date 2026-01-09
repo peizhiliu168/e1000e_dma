@@ -417,8 +417,21 @@ static int e1000_probe(struct pci_dev *pdev, const struct pci_device_id *ent) {
     goto err_free_rx;
 
   netdev->netdev_ops = &e1000_netdev_ops;
-  /* Hardcode a random MAC for simple testing if not read from EEPROM */
-  eth_hw_addr_random(netdev);
+  netdev->netdev_ops = &e1000_netdev_ops;
+  /* Hardcode MAC: DE:AD:BE:EF:CA:FE */
+  {
+    u8 mac[6] = {0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE};
+    memcpy(netdev->dev_addr, mac, 6);
+
+    /* Program RAL0/RAH0 with this MAC */
+    /* RAL0: Low 32 bits (mac[0]..mac[3]) */
+    u32 ral = (mac[0]) | (mac[1] << 8) | (mac[2] << 16) | (mac[3] << 24);
+    /* RAH0: High 16 bits (mac[4]..mac[5]) | AV (Address Valid) */
+    u32 rah = (mac[4]) | (mac[5] << 8) | E1000_RAH_AV;
+
+    E1000_WRITE_REG(adapter->hw_addr, E1000_RAL0, ral);
+    E1000_WRITE_REG(adapter->hw_addr, E1000_RAH0, rah);
+  }
 
   pr_info("%s: Assigned MAC: %pM\n", DRV_NAME, netdev->dev_addr);
 

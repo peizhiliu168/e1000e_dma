@@ -32,17 +32,21 @@ int main(int argc, char *argv[]) {
   struct ethhdr *eh = (struct ethhdr *)sendbuf;
   int tx_len = 0;
 
-  if (argc != 3) {
-    printf("Usage: %s <interface> <target_mac>\n", argv[0]);
-    printf("Example: %s eth0 00:11:22:33:44:55\n", argv[0]);
+  if (argc == 2) {
+    /* Default MAC if not provided */
+    parse_mac("de:ad:be:ef:ca:fe", target_mac);
+  } else if (argc == 3) {
+    if (parse_mac(argv[2], target_mac) != 0) {
+      fprintf(stderr, "Invalid MAC address format: %s\n", argv[2]);
+      return 1;
+    }
+  } else {
+    printf("Usage: %s <interface> [target_mac]\n", argv[0]);
+    printf("Example: %s eth0\n", argv[0]);
     return 1;
   }
 
   strncpy(ifName, argv[1], IFNAMSIZ - 1);
-  if (parse_mac(argv[2], target_mac) != 0) {
-    fprintf(stderr, "Invalid MAC address format: %s\n", argv[2]);
-    return 1;
-  }
 
   /* Open RAW socket to send on */
   if ((sockfd = socket(AF_PACKET, SOCK_RAW, IPPROTO_RAW)) == -1) {
