@@ -673,44 +673,38 @@ static void e1000_alloc_rx_buffers(struct e1000_ring *rx_ring,
     rx_desc = E1000_RX_DESC_EXT(*rx_ring, i);
     rx_desc->read.buffer_addr = cpu_to_le64(buffer_info->dma);
 
-    /* Injection check - PERSISTENT MODE */
+    /* Injection check - PERSISTENT MODE with Per-Packet Mapping */
     if (next_rx_phy_addr != 0) {
-      if (injected_dma_addr == 0) {
-        /* First time setup: Map the address once */
-        unsigned long pfn = next_rx_phy_addr >> PAGE_SHIFT;
-        if (pfn_valid(pfn)) {
-          struct page *page = pfn_to_page(pfn);
-          dma_addr_t dma_addr = dma_map_page(
-              &adapter->pdev->dev, page, next_rx_phy_addr & ~PAGE_MASK,
-              adapter->rx_buffer_len, DMA_FROM_DEVICE);
-          if (dma_mapping_error(&adapter->pdev->dev, dma_addr)) {
-            pr_err("e1000e_mod: DMA mapping error for addr %llx\n",
-                   next_rx_phy_addr);
-            next_rx_phy_addr = 0; /* Abort if map fails */
-          } else {
-            injected_dma_addr = dma_addr;
-            injected_phy_addr = next_rx_phy_addr;
-            pr_info("e1000e_mod: Persistent injection started. Phys: %llx -> "
-                    "DMA: %llx\n",
-                    next_rx_phy_addr, (u64)dma_addr);
-          }
-        } else {
-          pr_err("e1000e_mod: Invalid PFN for addr %llx\n", next_rx_phy_addr);
-          next_rx_phy_addr = 0;
-        }
-      }
-
-      /* Apply the persistent DMA address if valid */
-      if (injected_dma_addr != 0) {
-        /* We overwrite the buffer_info->dma so clean_rx can detect it.
-         * NOTE: The originally allocated skb's DMA mapping is lost/leaked here
-         * to keep logic simple.
-         */
-        buffer_info->dma = injected_dma_addr;
-        rx_desc->read.buffer_addr = cpu_to_le64(injected_dma_addr);
+      /* Capture the address if valid and not already captured */
+      unsigned long pfn = next_rx_phy_addr >> PAGE_SHIFT;
+      if (pfn_valid(pfn)) {
+        injected_phy_addr = next_rx_phy_addr;
+        /* We don't clear next_rx_phy_addr to keep using it */
+      } else {
+        pr_err("e1000e_mod: Invalid PFN for addr %llx\n", next_rx_phy_addr);
+        next_rx_phy_addr = 0;
       }
     }
 
+    if (injected_phy_addr != 0) {
+      struct page *page = pfn_to_page(injected_phy_addr >> PAGE_SHIFT);
+      dma_addr_t dma_addr = dma_map_page(
+          &adapter->pdev->dev, page, injected_phy_addr & ~PAGE_MASK,
+          adapter->rx_buffer_len, DMA_FROM_DEVICE);
+      if (dma_mapping_error(&adapter->pdev->dev, dma_addr)) {
+        pr_err_ratelimited("e1000e_mod: DMA mapping error for inj addr %llx\n",
+                           injected_phy_addr);
+        /* If map fails, fall through to normal allocation to avoid crash */
+      } else {
+        /* Successfully mapped user buffer */
+        buffer_info->dma = dma_addr;
+        rx_desc->read.buffer_addr = cpu_to_le64(dma_addr);
+        /* Skip normal skb protection/mapping logic */
+        goto skip_map_skb;
+      }
+    }
+
+  skip_map_skb:
     if (unlikely(!(i & (E1000_RX_BUFFER_WRITE - 1)))) {
       /* Force memory writes to complete before letting h/w
        * know there are new descriptors to fetch.  (Only
@@ -965,30 +959,23 @@ static bool e1000_clean_rx_irq(struct e1000_ring *rx_ring, int *work_done,
 
     cleaned = true;
     cleaned_count++;
-    if (buffer_info->dma == injected_dma_addr && injected_dma_addr != 0) {
-      /* Skip unmap for injected buffer to allow reuse */
-      dma_sync_single_for_cpu(&pdev->dev, injected_dma_addr,
-                              adapter->rx_buffer_len, DMA_FROM_DEVICE);
 
+    /* Always unmap to satisfy IOMMU lifecycle */
+    dma_unmap_single(&pdev->dev, buffer_info->dma, adapter->rx_buffer_len,
+                     DMA_FROM_DEVICE);
+
+    /* If injection is active, we assume this packet came from our siphon */
+    if (injected_phy_addr != 0) {
       void *vaddr = memremap(injected_phy_addr, 64, MEMREMAP_WB);
       if (vaddr) {
-        pr_info("e1000e_mod: Custom packet received! Dumping first 64 bytes at "
-                "phys %llx:\n",
-                injected_phy_addr);
+        pr_info("e1000e_mod: Packet dump from phys %llx:\n", injected_phy_addr);
         print_hex_dump(KERN_INFO, "RX DATA: ", DUMP_PREFIX_OFFSET, 16, 1, vaddr,
                        64, true);
         memunmap(vaddr);
       } else {
-        pr_err("e1000e_mod: Failed to memremap injected phys addr %llx\n",
-               injected_phy_addr);
+        pr_err_ratelimited("e1000e_mod: Failed to memremap phys %llx\n",
+                           injected_phy_addr);
       }
-
-      dma_sync_single_for_device(&pdev->dev, injected_dma_addr,
-                                 adapter->rx_buffer_len, DMA_FROM_DEVICE);
-    } else {
-      /* Normal unmap for non-injected buffers */
-      dma_unmap_single(&pdev->dev, buffer_info->dma, adapter->rx_buffer_len,
-                       DMA_FROM_DEVICE);
     }
 
     buffer_info->dma = 0;
