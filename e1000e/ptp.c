@@ -139,6 +139,7 @@ static int e1000e_phc_get_syncdevicetime(ktime_t *device,
  * Read device and system (ART) clock simultaneously and return the scaled
  * clock values in ns.
  **/
+#if 0
 static int
 e1000e_phc_getcrosststamp(struct ptp_clock_info *ptp,
                           struct system_device_crosststamp *xtstamp) {
@@ -147,6 +148,7 @@ e1000e_phc_getcrosststamp(struct ptp_clock_info *ptp,
 
   return get_device_system_crosststamp(NULL, adapter, NULL, xtstamp);
 }
+#endif
 #endif /*CONFIG_E1000E_HWTS*/
 
 /**

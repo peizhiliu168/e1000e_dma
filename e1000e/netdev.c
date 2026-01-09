@@ -4685,7 +4685,7 @@ static void e1000e_update_phy_task(struct work_struct *work) {
  * the phy
  **/
 static void e1000_update_phy_info(struct timer_list *t) {
-  adapter = from_timer(adapter, t, phy_info_timer);
+  struct e1000_adapter *adapter = from_timer(adapter, t, phy_info_timer);
 
   if (test_bit(__E1000_DOWN, &adapter->state))
     return;
@@ -5008,7 +5008,7 @@ static void e1000e_check_82574_phy_workaround(struct e1000_adapter *adapter) {
  * @t: pointer to timer_list containing private info adapter
  **/
 static void e1000_watchdog(struct timer_list *t) {
-  adapter = from_timer(adapter, t, watchdog_timer);
+  struct e1000_adapter *adapter = from_timer(adapter, t, watchdog_timer);
 
   /* Do the rest outside of interrupt context */
   schedule_work(&adapter->watchdog_task);
