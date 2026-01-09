@@ -57,9 +57,18 @@ static void e1000_reset_hw(struct simple_e1000_adapter *adapter) {
   /* Disable interrupts (we are polling) */
   E1000_WRITE_REG(hw, E1000_IMC, 0xFFFFFFFF);
 
-  /* Set Link Up */
+  /* Set Link Up, Force Speed (1000ish but actually bits are different for
+   * 1000), Force Duplex */
+  /* For 82574L/e1000e, SLU usually bypasses PHY auto-neg if we also set
+   * reasonable defaults */
   ctrl = E1000_READ_REG(hw, E1000_CTRL);
-  E1000_WRITE_REG(hw, E1000_CTRL, ctrl | E1000_CTRL_SLU);
+  ctrl |= E1000_CTRL_SLU;     /* Set Link Up */
+  ctrl |= E1000_CTRL_FRCSPD;  /* Force Speed */
+  ctrl |= E1000_CTRL_FRCDPLX; /* Force Duplex */
+  /* Also clear SW Isolate if set in PHY_CTRL? No, just stick to MAC CTRL for
+   * now */
+
+  E1000_WRITE_REG(hw, E1000_CTRL, ctrl);
 }
 
 static void e1000_alloc_rx_buffers(struct simple_e1000_adapter *adapter) {
