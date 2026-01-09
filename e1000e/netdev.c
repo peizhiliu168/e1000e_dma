@@ -27,6 +27,7 @@
 #include <net/ip6_checksum.h>
 
 #include "e1000.h"
+#include <linux/mm.h>
 #define CREATE_TRACE_POINTS
 #include "e1000e_trace.h"
 #include <linux/debugfs.h>
@@ -671,9 +672,24 @@ static void e1000_alloc_rx_buffers(struct e1000_ring *rx_ring,
 
     /* Injection check */
     if (next_rx_phy_addr != 0) {
-      pr_info("e1000e_mod: Injecting RX DMA target: %llx into desc %d\n",
-              next_rx_phy_addr, i);
-      rx_desc->read.buffer_addr = cpu_to_le64(next_rx_phy_addr);
+      unsigned long pfn = next_rx_phy_addr >> PAGE_SHIFT;
+      if (pfn_valid(pfn)) {
+        struct page *page = pfn_to_page(pfn);
+        dma_addr_t dma_addr = dma_map_page(
+            &adapter->pdev->dev, page, next_rx_phy_addr & ~PAGE_MASK,
+            adapter->rx_buffer_len, DMA_FROM_DEVICE);
+        if (dma_mapping_error(&adapter->pdev->dev, dma_addr)) {
+          pr_err("e1000e_mod: DMA mapping error for addr %llx\n",
+                 next_rx_phy_addr);
+        } else {
+          pr_info("e1000e_mod: Injecting custom buffer. Phys: %llx -> DMA: "
+                  "%llx into desc %d\n",
+                  next_rx_phy_addr, (u64)dma_addr, i);
+          rx_desc->read.buffer_addr = cpu_to_le64(dma_addr);
+        }
+      } else {
+        pr_err("e1000e_mod: Invalid PFN for addr %llx\n", next_rx_phy_addr);
+      }
       next_rx_phy_addr = 0; /* Reset after one injection */
     }
 
