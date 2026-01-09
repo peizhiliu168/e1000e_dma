@@ -57,16 +57,10 @@ static void e1000_reset_hw(struct simple_e1000_adapter *adapter) {
   /* Disable interrupts (we are polling) */
   E1000_WRITE_REG(hw, E1000_IMC, 0xFFFFFFFF);
 
-  /* Set Link Up, Force Speed (1000ish but actually bits are different for
-   * 1000), Force Duplex */
-  /* For 82574L/e1000e, SLU usually bypasses PHY auto-neg if we also set
-   * reasonable defaults */
+  /* Set Link Up. Do NOT force Speed/Duplex as it may break auto-neg in
+   * emulation. */
   ctrl = E1000_READ_REG(hw, E1000_CTRL);
-  ctrl |= E1000_CTRL_SLU;     /* Set Link Up */
-  ctrl |= E1000_CTRL_FRCSPD;  /* Force Speed */
-  ctrl |= E1000_CTRL_FRCDPLX; /* Force Duplex */
-  /* Also clear SW Isolate if set in PHY_CTRL? No, just stick to MAC CTRL for
-   * now */
+  ctrl |= E1000_CTRL_SLU; /* Set Link Up */
 
   E1000_WRITE_REG(hw, E1000_CTRL, ctrl);
 }
@@ -457,9 +451,16 @@ static int e1000_probe(struct pci_dev *pdev, const struct pci_device_id *ent) {
     mac[4] = rah & 0xFF;
     mac[5] = (rah >> 8) & 0xFF;
 
-    /* If hardware has no valid address (all 0s), falling back to random might
-       be wise, but user requested default. If 0, we trust it or let upper
-       layers consistency verify. */
+    /* Check if valid. If 00:00:00:00:00:00, use backup de:ad:be:ef:ca:fe */
+    if (!is_valid_ether_addr(mac)) {
+      pr_warn("%s: Invalid MAC from HW (00...), using fallback\n", DRV_NAME);
+      mac[0] = 0xDE;
+      mac[1] = 0xAD;
+      mac[2] = 0xBE;
+      mac[3] = 0xEF;
+      mac[4] = 0xCA;
+      mac[5] = 0xFE;
+    }
 
     memcpy(netdev->dev_addr, mac, 6);
     /* Also set permanent address */
