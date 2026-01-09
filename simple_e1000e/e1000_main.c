@@ -438,6 +438,10 @@ static int e1000_probe(struct pci_dev *pdev, const struct pci_device_id *ent) {
 
   netdev->netdev_ops = &e1000_netdev_ops;
   netdev->netdev_ops = &e1000_netdev_ops;
+
+  /* Reset HW to reload MAC from NVM/EEPROM */
+  e1000_reset_hw(adapter);
+
   /* Read MAC from Hardware (RAL0/RAH0/NVM) */
   {
     u32 ral = readl(adapter->hw_addr + E1000_RAL0);
