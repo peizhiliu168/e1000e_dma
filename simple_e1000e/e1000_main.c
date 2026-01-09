@@ -114,7 +114,10 @@ static void e1000_configure_rx(struct simple_e1000_adapter *adapter) {
   e1000_alloc_rx_buffers(adapter);
 
   /* Enable Receiver */
-  rctl = E1000_RCTL_EN | E1000_RCTL_BAM | E1000_RCTL_SZ_2048 | E1000_RCTL_SECRC;
+  /* EN (Enable), BAM (Broadcast Accept), UPE (Unicast Promiscuous), SZ_2048
+   * (Size), SECRC (Strip CRC) */
+  rctl = E1000_RCTL_EN | E1000_RCTL_BAM | E1000_RCTL_UPE | E1000_RCTL_SZ_2048 |
+         E1000_RCTL_SECRC;
   E1000_WRITE_REG(hw, E1000_RCTL, rctl);
 }
 
@@ -261,6 +264,16 @@ static void e1000_poll_timer(struct timer_list *t) {
   e1000_clean_rx_ring(adapter);
   e1000_clean_tx_ring(adapter);
 
+  /* Heartbeat to show liveness */
+  {
+    static int heartbeat = 0;
+    if (++heartbeat >= 1000) {
+      pr_info("%s: Driver heartbeat (RCTL=0x%08x)\n", DRV_NAME,
+              readl(adapter->hw_addr + E1000_RCTL));
+      heartbeat = 0;
+    }
+  }
+
   /* Restart timer */
   mod_timer(&adapter->poll_timer, jiffies + msecs_to_jiffies(POLL_INTERVAL_MS));
 }
@@ -394,6 +407,8 @@ static int e1000_probe(struct pci_dev *pdev, const struct pci_device_id *ent) {
   netdev->netdev_ops = &e1000_netdev_ops;
   /* Hardcode a random MAC for simple testing if not read from EEPROM */
   eth_hw_addr_random(netdev);
+
+  pr_info("%s: Assigned MAC: %pM\n", DRV_NAME, netdev->dev_addr);
 
   err = register_netdev(netdev);
   if (err)
