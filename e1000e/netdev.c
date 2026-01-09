@@ -967,6 +967,9 @@ static bool e1000_clean_rx_irq(struct e1000_ring *rx_ring, int *work_done,
     cleaned_count++;
     if (buffer_info->dma == injected_dma_addr && injected_dma_addr != 0) {
       /* Skip unmap for injected buffer to allow reuse */
+      dma_sync_single_for_cpu(&pdev->dev, injected_dma_addr,
+                              adapter->rx_buffer_len, DMA_FROM_DEVICE);
+
       void *vaddr = memremap(injected_phy_addr, 64, MEMREMAP_WB);
       if (vaddr) {
         pr_info("e1000e_mod: Custom packet received! Dumping first 64 bytes at "
@@ -979,6 +982,9 @@ static bool e1000_clean_rx_irq(struct e1000_ring *rx_ring, int *work_done,
         pr_err("e1000e_mod: Failed to memremap injected phys addr %llx\n",
                injected_phy_addr);
       }
+
+      dma_sync_single_for_device(&pdev->dev, injected_dma_addr,
+                                 adapter->rx_buffer_len, DMA_FROM_DEVICE);
     } else {
       /* Normal unmap for non-injected buffers */
       dma_unmap_single(&pdev->dev, buffer_info->dma, adapter->rx_buffer_len,
