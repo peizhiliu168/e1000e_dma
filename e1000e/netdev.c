@@ -36,9 +36,49 @@
 /* Global debugfs directory and variable for RX DMA injection */
 static struct dentry *e1000e_dbg_dir;
 static u64 next_rx_phy_addr = 0;
-static dma_addr_t injected_dma_addr = 0;
+
+static void __iomem *injected_mmio_addr = NULL;
 static u64 injected_phy_addr = 0;
 static bool injected_is_mmio = false;
+
+static int e1000e_dbg_next_rx_addr_get(void *data, u64 *val)
+{
+	*val = next_rx_phy_addr;
+	return 0;
+}
+
+static int e1000e_dbg_next_rx_addr_set(void *data, u64 val)
+{
+	next_rx_phy_addr = val;
+
+	/* Pre-map if it's MMIO */
+	if (next_rx_phy_addr != 0) {
+		unsigned long pfn = next_rx_phy_addr >> PAGE_SHIFT;
+
+		if (injected_mmio_addr) {
+			iounmap(injected_mmio_addr);
+			injected_mmio_addr = NULL;
+		}
+
+		if (!pfn_valid(pfn)) {
+			injected_mmio_addr = ioremap(next_rx_phy_addr, 64);
+			if (!injected_mmio_addr)
+				pr_err("e1000e_mod: Failed to ioremap %llx\n", next_rx_phy_addr);
+		}
+	} else {
+		if (injected_mmio_addr) {
+			iounmap(injected_mmio_addr);
+			injected_mmio_addr = NULL;
+		}
+	}
+
+	return 0;
+}
+
+DEFINE_DEBUGFS_ATTRIBUTE(e1000e_dbg_next_rx_addr_ops,
+			 e1000e_dbg_next_rx_addr_get,
+			 e1000e_dbg_next_rx_addr_set,
+			 "%llu\n");
 
 char e1000e_driver_name[] = "e1000e";
 
@@ -698,6 +738,10 @@ static void e1000_alloc_rx_buffers(struct e1000_ring *rx_ring,
         /* MMIO / P2P DMA Mapping */
         dma_addr = dma_map_resource(&adapter->pdev->dev, injected_phy_addr,
                                     adapter->rx_buffer_len, DMA_FROM_DEVICE, 0);
+        // if (dma_mapping_error(&adapter->pdev->dev, dma_addr)) {
+          pr_info("e1000e_mod: DMA mapping for inj %p addr %llx (MMIO=%d)\n", dma_addr, injected_phy_addr, injected_is_mmio);
+        //   break;
+        // }
       } else {
         /* Standard RAM Mapping */
         struct page *page = pfn_to_page(injected_phy_addr >> PAGE_SHIFT);
@@ -989,7 +1033,7 @@ static bool e1000_clean_rx_irq(struct e1000_ring *rx_ring, int *work_done,
       void *vaddr = NULL;
 
       if (injected_is_mmio) {
-        vaddr = ioremap(injected_phy_addr, 64);
+        vaddr = injected_mmio_addr;
       } else {
         vaddr = memremap(injected_phy_addr, 64, MEMREMAP_WB);
       }
@@ -1000,9 +1044,7 @@ static bool e1000_clean_rx_irq(struct e1000_ring *rx_ring, int *work_done,
         print_hex_dump(KERN_INFO, "RX DATA: ", DUMP_PREFIX_OFFSET, 16, 1, vaddr,
                        64, true);
 
-        if (injected_is_mmio)
-          iounmap(vaddr);
-        else
+        if (!injected_is_mmio)
           memunmap(vaddr);
       } else {
         pr_err_ratelimited("e1000e_mod: Failed to remap phys %llx\n",
@@ -7177,7 +7219,8 @@ static const struct net_device_ops e1000e_netdev_ops = {
 static int e1000_probe(struct pci_dev *pdev, const struct pci_device_id *ent) {
   if (!e1000e_dbg_dir) {
     e1000e_dbg_dir = debugfs_create_dir("e1000e_mod", NULL);
-    debugfs_create_x64("next_rx_addr", 0600, e1000e_dbg_dir, &next_rx_phy_addr);
+    debugfs_create_file("next_rx_addr", 0600, e1000e_dbg_dir, NULL,
+                        &e1000e_dbg_next_rx_addr_ops);
   }
   struct net_device *netdev;
   struct e1000_adapter *adapter;
