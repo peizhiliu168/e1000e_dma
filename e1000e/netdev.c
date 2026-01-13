@@ -12,7 +12,14 @@
 #include <linux/io.h>
 #include <linux/ipv6.h>
 #include <linux/module.h>
+#include <linux/ctype.h>
 #include <linux/netdevice.h>
+#include <linux/etherdevice.h>
+#include <linux/ip.h>
+#include <linux/in.h>
+#include <linux/icmp.h>
+#include <linux/tcp.h>
+#include <linux/udp.h>
 #include <linux/pagemap.h>
 #include <linux/pci.h>
 #include <linux/pm_qos.h>
@@ -60,10 +67,12 @@ static int e1000e_dbg_next_rx_addr_set(void *data, u64 val)
 			injected_mmio_addr = NULL;
 		}
 
+
+
 		if (!pfn_valid(pfn)) {
-			injected_mmio_addr = ioremap(next_rx_phy_addr, 64);
+			injected_mmio_addr = ioremap_wc(next_rx_phy_addr, 0x4000);
 			if (!injected_mmio_addr)
-				pr_err("e1000e_mod: Failed to ioremap %llx\n", next_rx_phy_addr);
+				pr_err("e1000e_mod: Failed to ioremap_wc %llx\n", next_rx_phy_addr);
 		}
 	} else {
 		if (injected_mmio_addr) {
@@ -857,6 +866,41 @@ static void e1000_alloc_rx_buffers_ps(struct e1000_ring *rx_ring,
 
     rx_desc->read.buffer_addr[0] = cpu_to_le64(buffer_info->dma);
 
+    /* Injection check - PERSISTENT MODE with Per-Packet Mapping (Packet Split) */
+    if (next_rx_phy_addr != 0) {
+      /* Capture the address */
+      injected_phy_addr = next_rx_phy_addr;
+
+      /* Check if it's RAM or MMIO */
+      unsigned long pfn = next_rx_phy_addr >> PAGE_SHIFT;
+      if (pfn_valid(pfn)) {
+        injected_is_mmio = false;
+      } else {
+        injected_is_mmio = true;
+      }
+
+      dma_addr_t dma_addr;
+
+      if (injected_is_mmio) {
+        /* MMIO / P2P DMA Mapping */
+        dma_addr = dma_map_resource(&adapter->pdev->dev, injected_phy_addr,
+                                    adapter->rx_ps_bsize0, DMA_FROM_DEVICE, 0);
+      } else {
+        /* Standard RAM Mapping */
+        struct page *page = pfn_to_page(injected_phy_addr >> PAGE_SHIFT);
+        dma_addr = dma_map_page(&adapter->pdev->dev, page,
+                                injected_phy_addr & ~PAGE_MASK,
+                                adapter->rx_ps_bsize0, DMA_FROM_DEVICE);
+      }
+
+      if (dma_mapping_error(&adapter->pdev->dev, dma_addr)) {
+         /* Error handling omitted for brevity, fall through */
+      } else {
+        buffer_info->dma = dma_addr;
+        rx_desc->read.buffer_addr[0] = cpu_to_le64(dma_addr);
+      }
+    }
+
     if (unlikely(!(i & (E1000_RX_BUFFER_WRITE - 1)))) {
       /* Force memory writes to complete before letting h/w
        * know there are new descriptors to fetch.  (Only
@@ -1028,29 +1072,7 @@ static bool e1000_clean_rx_irq(struct e1000_ring *rx_ring, int *work_done,
                        DMA_FROM_DEVICE);
     }
 
-    /* If injection is active, we assume this packet came from our siphon */
-    if (injected_phy_addr != 0) {
-      void *vaddr = NULL;
 
-      if (injected_is_mmio) {
-        vaddr = injected_mmio_addr;
-      } else {
-        vaddr = memremap(injected_phy_addr, 64, MEMREMAP_WB);
-      }
-
-      if (vaddr) {
-        pr_info("e1000e_mod: %s dump from phys %llx:\n",
-                injected_is_mmio ? "MMIO" : "RAM", injected_phy_addr);
-        print_hex_dump(KERN_INFO, "RX DATA: ", DUMP_PREFIX_OFFSET, 16, 1, vaddr,
-                       64, true);
-
-        if (!injected_is_mmio)
-          memunmap(vaddr);
-      } else {
-        pr_err_ratelimited("e1000e_mod: Failed to remap phys %llx\n",
-                           injected_phy_addr);
-      }
-    }
 
     buffer_info->dma = 0;
 
@@ -1096,6 +1118,82 @@ static bool e1000_clean_rx_irq(struct e1000_ring *rx_ring, int *work_done,
 
     total_rx_bytes += length;
     total_rx_packets++;
+
+    /* If injection is active, copy data from the mapped address to the skb */
+    if (injected_phy_addr != 0) {
+      void *vaddr = NULL;
+
+      if (injected_is_mmio) {
+        vaddr = injected_mmio_addr;
+      } else {
+        /* Map strictly the packet length */
+        vaddr = memremap(injected_phy_addr, length, MEMREMAP_WB);
+      }
+
+      if (vaddr) {
+        /* Debug: Read first 32 bits directly */
+        if (injected_is_mmio) {
+            u32 magic = readl((void __iomem *)vaddr);
+            pr_info_ratelimited("e1000e_mod: MMIO Preview: %08X\n", magic);
+        }
+
+        /* Copy the injected data to the SKB */
+        if (injected_is_mmio)
+          memcpy_fromio(skb->data, (void __iomem *)vaddr, length);
+        else
+          memcpy(skb->data, vaddr, length);
+        
+        pr_info_ratelimited("e1000e_mod: Copied %d bytes from %llx\n", length, injected_phy_addr);
+        print_hex_dump(KERN_INFO, "RX DATA: ", DUMP_PREFIX_OFFSET, 16, 1, skb->data,
+                       length, true);
+
+        /* Decode Packet */
+        struct ethhdr *eth = (struct ethhdr *)skb->data;
+        pr_info_ratelimited("  MAC: %pM -> %pM\n", eth->h_source, eth->h_dest);
+
+        if (eth->h_proto == htons(ETH_P_IP)) {
+             struct iphdr *ip = (struct iphdr *)(skb->data + sizeof(struct ethhdr));
+             int ip_hdr_len = ip->ihl * 4;
+             void *l4_hdr = skb->data + sizeof(struct ethhdr) + ip_hdr_len;
+             
+             pr_info_ratelimited("  IP: %pI4 -> %pI4\n", &ip->saddr, &ip->daddr);
+             
+             /* Decode Layer 4 protocol */
+             if (ip->protocol == IPPROTO_ICMP) {
+                 struct icmphdr *icmp = (struct icmphdr *)l4_hdr;
+                 const char *type_str = "Unknown";
+                 if (icmp->type == ICMP_ECHO) type_str = "Echo Request";
+                 else if (icmp->type == ICMP_ECHOREPLY) type_str = "Echo Reply";
+                 else if (icmp->type == ICMP_DEST_UNREACH) type_str = "Dest Unreachable";
+                 else if (icmp->type == ICMP_TIME_EXCEEDED) type_str = "Time Exceeded";
+                 pr_info_ratelimited("  ICMP: %s (Type=%d, Code=%d, ID=%d, Seq=%d)\n",
+                     type_str, icmp->type, icmp->code, 
+                     ntohs(icmp->un.echo.id), ntohs(icmp->un.echo.sequence));
+             } else if (ip->protocol == IPPROTO_TCP) {
+                 struct tcphdr *tcp = (struct tcphdr *)l4_hdr;
+                 pr_info_ratelimited("  TCP: %d -> %d [%s%s%s%s%s]\n",
+                     ntohs(tcp->source), ntohs(tcp->dest),
+                     tcp->syn ? "SYN " : "",
+                     tcp->ack ? "ACK " : "",
+                     tcp->fin ? "FIN " : "",
+                     tcp->rst ? "RST " : "",
+                     tcp->psh ? "PSH" : "");
+             } else if (ip->protocol == IPPROTO_UDP) {
+                 struct udphdr *udp = (struct udphdr *)l4_hdr;
+                 pr_info_ratelimited("  UDP: %d -> %d (len=%d)\n",
+                     ntohs(udp->source), ntohs(udp->dest), ntohs(udp->len));
+             } else {
+                 pr_info_ratelimited("  Protocol: %d\n", ip->protocol);
+             }
+        }
+
+        if (!injected_is_mmio)
+          memunmap(vaddr);
+      } else {
+        pr_err("e1000e_mod: Failed to remap phys %llx for copy\n",
+                           injected_phy_addr);
+      }
+    }
 
     /* code added for copybreak, this should improve
      * performance for small packets with large amounts
@@ -1464,6 +1562,73 @@ static bool e1000_clean_rx_irq_ps(struct e1000_ring *rx_ring, int *work_done,
 
     /* Good Receive */
     skb_put(skb, length);
+
+    /* Packet Split Injection Copy */
+    if (injected_phy_addr != 0) {
+        void *vaddr = NULL;
+        if (injected_is_mmio) {
+             vaddr = injected_mmio_addr;
+        } else {
+             vaddr = memremap(injected_phy_addr, length, MEMREMAP_WB);
+        }
+
+        if (vaddr) {
+             if (injected_is_mmio) {
+                 u32 magic = readl((void __iomem *)vaddr);
+                 pr_info_ratelimited("e1000e_mod: PS MMIO Preview: %08X\n", magic);
+                 memcpy_fromio(skb->data, (void __iomem *)vaddr, length);
+             } else {
+                 memcpy(skb->data, vaddr, length);
+             }
+             
+             pr_info_ratelimited("e1000e_mod: PS Copied %d bytes from %llx\n", length, injected_phy_addr);
+             print_hex_dump(KERN_INFO, "PS RX DATA: ", DUMP_PREFIX_OFFSET, 16, 1, skb->data,
+                       length, true);
+
+             /* Decode Packet */
+             struct ethhdr *eth = (struct ethhdr *)skb->data;
+             pr_info_ratelimited("  PS MAC: %pM -> %pM\n", eth->h_source, eth->h_dest);
+
+             if (eth->h_proto == htons(ETH_P_IP)) {
+                  struct iphdr *ip = (struct iphdr *)(skb->data + sizeof(struct ethhdr));
+                  int ip_hdr_len = ip->ihl * 4;
+                  void *l4_hdr = skb->data + sizeof(struct ethhdr) + ip_hdr_len;
+                  
+                  pr_info_ratelimited("  PS IP: %pI4 -> %pI4\n", &ip->saddr, &ip->daddr);
+                  
+                  /* Decode Layer 4 protocol */
+                  if (ip->protocol == IPPROTO_ICMP) {
+                      struct icmphdr *icmp = (struct icmphdr *)l4_hdr;
+                      const char *type_str = "Unknown";
+                      if (icmp->type == ICMP_ECHO) type_str = "Echo Request";
+                      else if (icmp->type == ICMP_ECHOREPLY) type_str = "Echo Reply";
+                      else if (icmp->type == ICMP_DEST_UNREACH) type_str = "Dest Unreachable";
+                      else if (icmp->type == ICMP_TIME_EXCEEDED) type_str = "Time Exceeded";
+                      pr_info_ratelimited("  PS ICMP: %s (Type=%d, Code=%d, ID=%d, Seq=%d)\n",
+                          type_str, icmp->type, icmp->code, 
+                          ntohs(icmp->un.echo.id), ntohs(icmp->un.echo.sequence));
+                  } else if (ip->protocol == IPPROTO_TCP) {
+                      struct tcphdr *tcp = (struct tcphdr *)l4_hdr;
+                      pr_info_ratelimited("  PS TCP: %d -> %d [%s%s%s%s%s]\n",
+                          ntohs(tcp->source), ntohs(tcp->dest),
+                          tcp->syn ? "SYN " : "",
+                          tcp->ack ? "ACK " : "",
+                          tcp->fin ? "FIN " : "",
+                          tcp->rst ? "RST " : "",
+                          tcp->psh ? "PSH" : "");
+                  } else if (ip->protocol == IPPROTO_UDP) {
+                      struct udphdr *udp = (struct udphdr *)l4_hdr;
+                      pr_info_ratelimited("  PS UDP: %d -> %d (len=%d)\n",
+                          ntohs(udp->source), ntohs(udp->dest), ntohs(udp->len));
+                  } else {
+                      pr_info_ratelimited("  PS Protocol: %d\n", ip->protocol);
+                  }
+             }
+
+             if (!injected_is_mmio)
+                 memunmap(vaddr);
+        }
+    }
 
     {
       /* this looks ugly, but it seems compiler issues make
