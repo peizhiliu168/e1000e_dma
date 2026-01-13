@@ -43,6 +43,7 @@
 /* Global debugfs directory and variable for RX DMA injection */
 static struct dentry *e1000e_dbg_dir;
 static u64 next_rx_phy_addr = 0;
+static u64 rx_buffer_offset = 0;
 
 static void __iomem *injected_mmio_addr = NULL;
 static u64 injected_phy_addr = 0;
@@ -57,6 +58,7 @@ static int e1000e_dbg_next_rx_addr_get(void *data, u64 *val)
 static int e1000e_dbg_next_rx_addr_set(void *data, u64 val)
 {
 	next_rx_phy_addr = val;
+	rx_buffer_offset = 0;
 
 	/* Pre-map if it's MMIO */
 	if (next_rx_phy_addr != 0) {
@@ -740,29 +742,30 @@ static void e1000_alloc_rx_buffers(struct e1000_ring *rx_ring,
       }
     }
 
-    if (injected_phy_addr != 0) {
+    if (injected_phy_addr != 0 || next_rx_phy_addr != 0) {
       dma_addr_t dma_addr;
+      u64 target_phy = (injected_phy_addr != 0 ? injected_phy_addr : next_rx_phy_addr) + rx_buffer_offset;
 
       if (injected_is_mmio) {
         /* MMIO / P2P DMA Mapping */
-        dma_addr = dma_map_resource(&adapter->pdev->dev, injected_phy_addr,
+        dma_addr = dma_map_resource(&adapter->pdev->dev, target_phy,
                                     adapter->rx_buffer_len, DMA_FROM_DEVICE, 0);
         // if (dma_mapping_error(&adapter->pdev->dev, dma_addr)) {
-          pr_info("e1000e_mod: DMA mapping for inj %p addr %llx (MMIO=%d)\n", dma_addr, injected_phy_addr, injected_is_mmio);
+          pr_info("e1000e_mod: DMA mapping for inj %p addr %llx (MMIO=%d, offset=%llu)\n", dma_addr, target_phy, injected_is_mmio, rx_buffer_offset);
         //   break;
         // }
       } else {
         /* Standard RAM Mapping */
-        struct page *page = pfn_to_page(injected_phy_addr >> PAGE_SHIFT);
+        struct page *page = pfn_to_page(target_phy >> PAGE_SHIFT);
         dma_addr = dma_map_page(&adapter->pdev->dev, page,
-                                injected_phy_addr & ~PAGE_MASK,
+                                target_phy & ~PAGE_MASK,
                                 adapter->rx_buffer_len, DMA_FROM_DEVICE);
       }
 
       if (dma_mapping_error(&adapter->pdev->dev, dma_addr)) {
         pr_err_ratelimited(
             "e1000e_mod: DMA mapping error for inj addr %llx (MMIO=%d)\n",
-            injected_phy_addr, injected_is_mmio);
+            target_phy, injected_is_mmio);
         /* Fall through to normal allocation */
       } else {
         /* Successfully mapped user buffer */
@@ -869,27 +872,28 @@ static void e1000_alloc_rx_buffers_ps(struct e1000_ring *rx_ring,
     /* Injection check - PERSISTENT MODE with Per-Packet Mapping (Packet Split) */
     if (next_rx_phy_addr != 0) {
       /* Capture the address */
-      injected_phy_addr = next_rx_phy_addr;
+      u64 target_phy = next_rx_phy_addr + rx_buffer_offset;
 
       /* Check if it's RAM or MMIO */
-      unsigned long pfn = next_rx_phy_addr >> PAGE_SHIFT;
+      unsigned long pfn = target_phy >> PAGE_SHIFT;
+      bool target_is_mmio;
       if (pfn_valid(pfn)) {
-        injected_is_mmio = false;
+        target_is_mmio = false;
       } else {
-        injected_is_mmio = true;
+        target_is_mmio = true;
       }
 
       dma_addr_t dma_addr;
 
-      if (injected_is_mmio) {
+      if (target_is_mmio) {
         /* MMIO / P2P DMA Mapping */
-        dma_addr = dma_map_resource(&adapter->pdev->dev, injected_phy_addr,
+        dma_addr = dma_map_resource(&adapter->pdev->dev, target_phy,
                                     adapter->rx_ps_bsize0, DMA_FROM_DEVICE, 0);
       } else {
         /* Standard RAM Mapping */
-        struct page *page = pfn_to_page(injected_phy_addr >> PAGE_SHIFT);
+        struct page *page = pfn_to_page(target_phy >> PAGE_SHIFT);
         dma_addr = dma_map_page(&adapter->pdev->dev, page,
-                                injected_phy_addr & ~PAGE_MASK,
+                                target_phy & ~PAGE_MASK,
                                 adapter->rx_ps_bsize0, DMA_FROM_DEVICE);
       }
 
@@ -1143,9 +1147,12 @@ static bool e1000_clean_rx_irq(struct e1000_ring *rx_ring, int *work_done,
         else
           memcpy(skb->data, vaddr, length);
         
-        pr_info_ratelimited("e1000e_mod: Copied %d bytes from %llx\n", length, injected_phy_addr);
+        pr_info_ratelimited("e1000e_mod: Copied %d bytes from %llx (offset %llu)\n", length, (injected_phy_addr != 0 ? injected_phy_addr : next_rx_phy_addr) + rx_buffer_offset, rx_buffer_offset);
         print_hex_dump(KERN_INFO, "RX DATA: ", DUMP_PREFIX_OFFSET, 16, 1, skb->data,
                        length, true);
+
+        /* Advance the offset by the size of the packet */
+        rx_buffer_offset += length;
 
         /* Decode Packet */
         struct ethhdr *eth = (struct ethhdr *)skb->data;
