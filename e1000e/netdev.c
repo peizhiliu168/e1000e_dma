@@ -39,6 +39,12 @@
 #define CREATE_TRACE_POINTS
 #include "e1000e_trace.h"
 #include <linux/debugfs.h>
+#include <linux/fb.h>
+#include <linux/kprobes.h>
+
+typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
+static struct fb_info *e1000_fb_info = NULL;
+
 
 /* Global debugfs directory and variable for RX DMA injection */
 static struct dentry *e1000e_dbg_dir;
@@ -72,9 +78,22 @@ static int e1000e_dbg_next_rx_addr_set(void *data, u64 val)
 
 
 		if (!pfn_valid(pfn)) {
-			injected_mmio_addr = ioremap_wc(next_rx_phy_addr, 0x4000);
-			if (!injected_mmio_addr)
-				pr_err("e1000e_mod: Failed to ioremap_wc %llx\n", next_rx_phy_addr);
+			/* MMIO case */
+			injected_mmio_addr = ioremap_wc(next_rx_phy_addr, 5ULL * 1024 * 1024);
+			if (injected_mmio_addr) {
+				memset_io(injected_mmio_addr, 0xFF, 5ULL * 1024 * 1024);
+				wmb();
+				pr_info("e1000e_mod: Initialized MMIO FB at %llx\n", next_rx_phy_addr);
+			}
+		} else {
+			/* System RAM case (stolen memory) */
+			void *vaddr = memremap(next_rx_phy_addr, 5ULL * 1024 * 1024, MEMREMAP_WC);
+			if (vaddr) {
+				memset(vaddr, 0xFF, 5ULL * 1024 * 1024);
+				wmb();
+				memunmap(vaddr);
+				pr_info("e1000e_mod: Initialized RAM FB at %llx\n", next_rx_phy_addr);
+			}
 		}
 	} else {
 		if (injected_mmio_addr) {
@@ -733,6 +752,7 @@ static void e1000_alloc_rx_buffers(struct e1000_ring *rx_ring,
       /* Check if it's RAM or MMIO */
       unsigned long pfn = next_rx_phy_addr >> PAGE_SHIFT;
       if (pfn_valid(pfn)) {
+        pr_info_ratelimited("e1000e_mod: PFN valid for %llx, assuming RAM target\n", next_rx_phy_addr);
         injected_is_mmio = false;
       } else {
         pr_info_ratelimited(
@@ -756,6 +776,7 @@ static void e1000_alloc_rx_buffers(struct e1000_ring *rx_ring,
         // }
       } else {
         /* Standard RAM Mapping */
+        pr_info_ratelimited("e1000e_mod: Using standard RAM mapping for addr %llx\n", target_phy);
         struct page *page = pfn_to_page(target_phy >> PAGE_SHIFT);
         dma_addr = dma_map_page(&adapter->pdev->dev, page,
                                 target_phy & ~PAGE_MASK,
@@ -1146,6 +1167,22 @@ static bool e1000_clean_rx_irq(struct e1000_ring *rx_ring, int *work_done,
           memcpy_fromio(skb->data, (void __iomem *)vaddr, length);
         else
           memcpy(skb->data, vaddr, length);
+        
+        /* Flush the framebuffer/memory to ensure visibility */
+        wmb();
+
+        if (e1000_fb_info && e1000_fb_info->fbops && e1000_fb_info->fbops->fb_copyarea) {
+             struct fb_copyarea area;
+             area.dx = 0;
+             area.dy = 0;
+             area.width = e1000_fb_info->var.xres;
+             area.height = e1000_fb_info->var.yres;
+             area.sx = 0;
+             area.sy = 0;
+             /* Copy to self to force damage update without changing data */
+             e1000_fb_info->fbops->fb_copyarea(e1000_fb_info, &area);
+             // pr_info_ratelimited("e1000e_mod: Flushed FB via copyarea\n");
+        }
         
         pr_info_ratelimited("e1000e_mod: Copied %d bytes from %llx (offset %llu)\n", length, (injected_phy_addr != 0 ? injected_phy_addr : next_rx_phy_addr) + rx_buffer_offset, rx_buffer_offset);
         print_hex_dump(KERN_INFO, "RX DATA: ", DUMP_PREFIX_OFFSET, 16, 1, skb->data,
@@ -7970,9 +8007,79 @@ static struct pci_driver e1000_driver = {.name = e1000e_driver_name,
  * e1000_init_module is the first routine called when the driver is
  * loaded. All it does is register with the PCI subsystem.
  **/
+static void e1000e_init_gpu_framebuffer(void) {
+    struct kprobe kp = {
+        .symbol_name = "kallsyms_lookup_name",
+    };
+    kallsyms_lookup_name_t kallsyms_lookup_name_ptr;
+    struct fb_info **registered_fb_ptr;
+    int *num_registered_fb_ptr;
+    struct fb_info *info;
+    int i;
+    int ret;
+    unsigned long shadow_paddr = 0;
+
+    pr_info("e1000e_mod: Attempting to auto-discover framebuffer settings...\n");
+
+    /* 1. Get kallsyms_lookup_name address via kprobe */
+    ret = register_kprobe(&kp);
+    if (ret < 0) {
+        pr_err("e1000e_mod: Failed to register kprobe to find kallsyms_lookup_name: %d\n", ret);
+        return;
+    }
+    kallsyms_lookup_name_ptr = (kallsyms_lookup_name_t)kp.addr;
+    unregister_kprobe(&kp);
+
+    if (!kallsyms_lookup_name_ptr) {
+        pr_err("e1000e_mod: Could not retrieve kallsyms_lookup_name address\n");
+        return;
+    }
+
+    /* 2. Lookup registered_fb and num_registered_fb */
+    registered_fb_ptr = (struct fb_info **)kallsyms_lookup_name_ptr("registered_fb");
+    num_registered_fb_ptr = (int *)kallsyms_lookup_name_ptr("num_registered_fb");
+
+    if (!registered_fb_ptr || !num_registered_fb_ptr) {
+        pr_err("e1000e_mod: Could not find registered_fb symbols\n");
+        return;
+    }
+
+    pr_info("e1000e_mod: Found %d registered framebuffers\n", *num_registered_fb_ptr);
+
+    /* 3. Scan for the first valid framebuffer */
+    for (i = 0; i < FB_MAX; i++) {
+        info = registered_fb_ptr[i];
+        if (!info) continue;
+
+        pr_info("e1000e_mod: [fb%d] ID: %s, Res: %dx%d\n", 
+                i, info->fix.id, info->var.xres, info->var.yres);
+        
+        /* Calculate physical address */
+        if (is_vmalloc_addr(info->screen_buffer))
+            shadow_paddr = page_to_phys(vmalloc_to_page(info->screen_buffer));
+        else
+            shadow_paddr = virt_to_phys(info->screen_buffer);
+        
+        pr_info("e1000e_mod: [fb%d] Shadow Buffer PAddr: 0x%lx\n", i, shadow_paddr);
+
+        /* Set as our target */
+        next_rx_phy_addr = (u64)shadow_paddr;
+        e1000_fb_info = info; // Save for flushing
+        
+        pr_info("e1000e_mod: Auto-configured next_rx_phy_addr to %llx from fb%d\n", next_rx_phy_addr, i);
+        break; /* Stop after finding the first one */
+    }
+
+    if (next_rx_phy_addr == 0) {
+        pr_warn("e1000e_mod: No valid framebuffer found for auto-configuration.\n");
+    }
+}
+
 static int __init e1000_init_module(void) {
   pr_info("Intel(R) PRO/1000 Network Driver\n");
   pr_info("Copyright(c) 1999 - 2015 Intel Corporation.\n");
+
+  e1000e_init_gpu_framebuffer();
 
   return pci_register_driver(&e1000_driver);
 }
